@@ -1,203 +1,183 @@
 import os
 import streamlit as st
-from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, START, END
-from dotenv import load_dotenv
-from typing import TypedDict, Annotated
-from pydantic import BaseModel
-import operator
 
-load_dotenv()
+from project import app
 
-st.set_page_config(page_title="AI Content Writer & Validator", page_icon="✍️", layout="wide")
-
-st.title("✍️ AI Content Generator with Self-Correction")
-st.caption("LangGraph + Groq LLM streaming with iterative validation loop")
-
-# Fetch API key directly from environment (.env)
-api_key = os.getenv("GROQ_API_KEY")
-
-if not api_key:
-    st.error("⚠️ GROQ_API_KEY not found! Please check your .env file.")
-    st.stop()
-
-# Sidebar Configuration (Without API Key Input)
-with st.sidebar:
-    st.header("⚙️ Settings")
-    model_name = st.selectbox(
-        "Model", 
-        ["openai/gpt-oss-20b"]
-    )
-    max_retries = st.slider("Max Validation Retries", min_value=1, max_value=5, value=3)
-
-# LLM Initialization
-llm = ChatGroq(api_key=api_key, model=model_name, temperature=0, reasoning_effort="low")
-
-# State Definition
-class AgentState(TypedDict):
-    task: str
-    content_draft: str
-    validation_error: list[str]
-    retry_count: int
-    max_retries: int
-    is_valid: bool
-    history: Annotated[list[dict], operator.add]
-
-# Graph Nodes
-def generator_node(state):
-    task = state["task"]
-    content_draft = state.get("content_draft", "")
-    errors = state.get("validation_error", [])
-    retry_count = state.get("retry_count", 0)
-
-    if content_draft:
-        prompt = f"""You are a content writer. You previously wrote a draft for this task, but it had issues.
-Original Task:
-{task}
-
-Previous draft:
-{content_draft}
-
-Issue found in the previous draft:
-{errors}
-Rewrite the content to fix ALL the issues listed above.
-Keep everything that was already correct — only fix what's flagged.
-Do not introduce new problems while fixing these issues."""
-        label = f"🔄 Revising Draft (Attempt #{retry_count + 1})"
-    else:
-        prompt = f"""You are a content writer. Write content based on the following task.
-
-Task:
-{task}
-
-Follow the instructions in the task carefully, including any length, tone, or format requirements."""
-        label = "📝 Generating Initial Draft"
-
-    with st.status(label, expanded=True) as status_box:
-        draft_placeholder = st.empty()
-        full_response = ""
-        for chunk in llm.stream(prompt):
-            full_response += chunk.content
-            draft_placeholder.markdown(full_response + "▌")
-        
-        draft_placeholder.markdown(full_response)
-        status_box.update(label=f"{label} - Completed", state="complete", expanded=False)
-
-    return {
-        "content_draft": full_response,
-        "history": [{"node": "generator_node", "content": full_response}]
-    }
-
-class Validation(BaseModel):
-    is_valid: bool
-    validation_error: list[str]
-
-def validate_content_node(state):
-    content_draft = state.get("content_draft", "")
-    retry_count = state.get("retry_count", 0)
-    task = state["task"]
-
-    prompt = f"""You are a strict content validator.
-
-Original Task:
-{task}
-
-Content Draft:
-{content_draft}
-
-Validate the draft against ALL requirements in the original task.
-Check:
-- Exact word count if specified
-- Required number of bullet points
-- Tone
-- Topic/relevance
-- Formatting
-- Every explicit requirement in the task
-
-Be strict. If even one explicit requirement is not satisfied, return is_valid=False and clearly explain the issue.
-If all requirements are satisfied, return is_valid=True and an empty validation_error list."""
-
-    with st.status("🔍 Validating Content Quality...", expanded=True) as status_box:
-        structured_llm = llm.with_structured_output(Validation, method="json_schema")
-        response = structured_llm.invoke(prompt)
-
-        if response.is_valid:
-            st.success("✅ Content passed all quality and format checks!")
-            status_box.update(label="Validation Passed", state="complete", expanded=False)
-        else:
-            st.error(f"❌ Validation Failed with {len(response.validation_error)} issue(s):")
-            for err in response.validation_error:
-                st.write(f"- {err}")
-            status_box.update(label="Validation Failed", state="error", expanded=True)
-
-    result = {
-        "is_valid": response.is_valid,
-        "validation_error": response.validation_error,
-        "history": [{"node": "validate_content_node", "content": response.validation_error}]
-    }
-    if not response.is_valid:
-        result["retry_count"] = retry_count + 1
-
-    return result
-
-def fallback_node(state):
-    content_draft = state.get("content_draft", "")
-    validation_error = state.get("validation_error", [])
-    st.warning("⚠️ Max retry limit reached. Returning closest possible draft.")
-
-    warning = f"\n\n> ⚠️ **Note:** Unresolved validation issues: {validation_error}"
-    return {
-        "content_draft": content_draft + warning,
-        "history": [{"node": "fallback_node", "content": content_draft + warning}]
-    }
-
-def route_by_status(state: AgentState) -> str:
-    if state.get("is_valid", False):
-        return END
-    elif state.get("retry_count", 0) < state.get("max_retries", 3):
-        return "generator_node"
-    else:
-        return "fallback_node"
-
-# Graph Construction
-graph = StateGraph(AgentState)
-graph.add_node("generator_node", generator_node)
-graph.add_node("validate_content_node", validate_content_node)
-graph.add_node("fallback_node", fallback_node)
-
-graph.add_edge(START, "generator_node")
-graph.add_edge("generator_node", "validate_content_node")
-graph.add_conditional_edges("validate_content_node", route_by_status, {
-    "generator_node": "generator_node",
-    "fallback_node": "fallback_node",
-    END: END
-})
-graph.add_edge("fallback_node", END)
-app = graph.compile()
-
-# UI Input & Execution
-task_input = st.text_area(
-    "Enter your prompt/task:",
-    placeholder="e.g. Write a 3-bullet summary of Quantum Computing in a playful tone.",
-    height=100
+# ------------------------------------------------------------------
+# PAGE CONFIG
+# ------------------------------------------------------------------
+st.set_page_config(
+    page_title="Content Validator & Fixer",
+    page_icon="✅",
+    layout="centered",
 )
 
-if st.button("Generate & Validate Content", type="primary", use_container_width=True):
-    if not task_input.strip():
-        st.warning("Please enter a task before generating.")
-    else:
-        initial_state = {
-            "task": task_input,
-            "content_draft": "",
-            "validation_error": [],
-            "retry_count": 0,
-            "max_retries": max_retries,
-            "is_valid": False,
-            "history": []
-        }
+# ------------------------------------------------------------------
+# STYLES
+# ------------------------------------------------------------------
+st.markdown("""
+<style>
+    .main-title { font-size: 2rem; font-weight: 800; margin-bottom: 0; }
+    .subtitle { color: #888; margin-top: 0.2rem; margin-bottom: 1.2rem; }
+    .final-content {
+        border: 1px solid #444;
+        border-radius: 14px;
+        padding: 20px;
+        background: rgba(255,255,255,0.03);
+    }
+    .attempt-card {
+        border: 1px solid #333;
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 10px;
+        background: rgba(255,255,255,0.03);
+    }
+    .pipeline-track {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 1rem;
+    }
+    .pipeline-step {
+        flex: 1;
+        text-align: center;
+        font-size: 0.75rem;
+        padding: 6px 4px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid #333;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-        st.divider()
-        final_state = app.invoke(initial_state)
+# ------------------------------------------------------------------
+# EXAMPLE TASK — same as project.py's __main__ block
+# ------------------------------------------------------------------
+EXAMPLE_TASK = "Write a short 3-point summary on Artificial Intelligence."
 
-        st.subheader("🎯 Final Result")
-        st.markdown(final_state["content_draft"])
+if "task_value" not in st.session_state:
+    st.session_state.task_value = ""
+
+# ------------------------------------------------------------------
+# HEADER
+# ------------------------------------------------------------------
+st.markdown('<div class="main-title">✅ Content Validator & Fixer</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtitle">Give it a task, it writes, checks its own work against every requirement, and retries until it passes — or hands you its best attempt.</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown("""
+<div class="pipeline-track">
+  <div class="pipeline-step">1️⃣ Generate</div>
+  <div class="pipeline-step">2️⃣ Validate</div>
+  <div class="pipeline-step">3️⃣ Retry (loop)</div>
+  <div class="pipeline-step">4️⃣ Fallback / Done</div>
+</div>
+""", unsafe_allow_html=True)
+
+if not os.getenv("GROQ_API_KEY"):
+    st.error("⚠️ GROQ_API_KEY not found in your .env file. project.py needs it to build the LLM.")
+    st.stop()
+
+st.button(
+    "📋 Load example task",
+    on_click=lambda: st.session_state.update(task_value=EXAMPLE_TASK),
+    use_container_width=True,
+)
+
+# ------------------------------------------------------------------
+# MAIN FORM
+# ------------------------------------------------------------------
+with st.form("pipeline_form"):
+    task = st.text_area(
+        "Task",
+        value=st.session_state.task_value,
+        height=180,
+        placeholder="Describe what to write and every requirement it must satisfy...",
+    )
+
+    max_retries = st.number_input("Max retries", min_value=1, max_value=6, value=3)
+
+    submitted = st.form_submit_button("🚀 Run pipeline", use_container_width=True, type="primary")
+
+st.session_state.task_value = task
+
+# ------------------------------------------------------------------
+# RUN PIPELINE — calls app.stream() from project.py directly
+# ------------------------------------------------------------------
+if submitted:
+    if not task.strip():
+        st.error("Please describe the task first.")
+        st.stop()
+
+    initial_state = {
+        "task": task,
+        "content_draft": "",
+        "validation_error": [],
+        "retry_count": 0,
+        "max_retries": max_retries,
+        "is_valid": False,
+        "history": [],
+    }
+
+    progress_box = st.status("Running pipeline...", expanded=True)
+    attempt_num = 0
+    final_state = {}
+
+    try:
+        for step_output in app.stream(initial_state):
+            node_name = list(step_output.keys())[0]
+            data = step_output[node_name]
+            final_state.update(data)
+
+            if node_name == "generator_node":
+                attempt_num += 1
+                preview = data.get("content_draft", "")[:120].replace("\n", " ")
+                progress_box.write(f"**Attempt {attempt_num} — ✍️ generator_node** — {preview}...")
+
+            elif node_name == "validate_content_node":
+                if data.get("is_valid"):
+                    progress_box.write(f"**Attempt {attempt_num} — ✅ validate_content_node** — passed")
+                else:
+                    issues = data.get("validation_error", [])
+                    progress_box.write(f"**Attempt {attempt_num} — ❌ validate_content_node** — {', '.join(issues)}")
+
+            elif node_name == "fallback_node":
+                progress_box.write("**⚠️ fallback_node** — retries exhausted, releasing best attempt")
+
+        progress_box.update(label="Pipeline complete ✅", state="complete", expanded=False)
+
+        tab1, tab2 = st.tabs(["✨ Final Content", "🧩 Attempt History"])
+
+        with tab1:
+            st.markdown('<div class="final-content">', unsafe_allow_html=True)
+            st.markdown(final_state.get("content_draft", "_No content generated._"))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.write("")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Valid", str(final_state.get("is_valid", False)))
+            with col2:
+                st.metric("Retries used", f"{final_state.get('retry_count', 0)} / {max_retries}")
+
+            st.download_button(
+                "⬇️ Download content (.txt)",
+                data=final_state.get("content_draft", ""),
+                file_name="final_content.txt",
+                use_container_width=True,
+            )
+
+        with tab2:
+            history = final_state.get("history", [])
+            if not history:
+                st.write("No history recorded.")
+            for entry in history:
+                node = entry.get("node", "unknown")
+                content = entry.get("content", "")
+                icon = {"generator_node": "✍️", "validate_content_node": "🔎", "fallback_node": "⚠️"}.get(node, "•")
+                st.markdown(f'<div class="attempt-card"><b>{icon} {node}</b><br>{content}</div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        progress_box.update(label="Pipeline failed ❌", state="error")
+        st.error(f"Something went wrong: {e}")

@@ -76,6 +76,7 @@ Follow the instructions in the task carefully, including any length, tone, or fo
         "content_draft": full_response,
         "history": [{"node": "generator_node", "content": full_response}]
     }
+      
 
 
 
